@@ -173,8 +173,8 @@ def collect_all(seen: dict[str, str]) -> list[dict]:
     return all_items
 
 
-def summarize_batch(items: list[dict]) -> dict[str, str]:
-    """Claude 1회 호출로 전체 item 한글 요약. {guid: summary_kr} 반환."""
+def summarize_batch(items: list[dict]) -> dict[str, dict]:
+    """Claude 1회 호출로 전체 item 한글 제목+요약 반환. {guid: {title_kr, summary_kr}}."""
     if not items:
         return {}
 
@@ -186,7 +186,7 @@ def summarize_batch(items: list[dict]) -> dict[str, str]:
     model = os.environ.get("CLAUDE_MODEL", "").strip() or "claude-sonnet-4-6"
     client = anthropic.Anthropic(api_key=api_key)
 
-    # 프롬프트 조립 — guid → 한글 2~3문장 요약 JSON
+    # 프롬프트 조립 — guid → {title_kr, summary_kr} JSON
     lines = []
     for i, it in enumerate(items, 1):
         lines.append(
@@ -198,15 +198,16 @@ def summarize_batch(items: list[dict]) -> dict[str, str]:
     body = "\n---\n".join(lines)
 
     system = (
-        "너는 기술 뉴스 편집자다. 각 기사를 한국어로 2~3문장(120자 이상 220자 이하)으로 요약한다.\n"
+        "너는 기술 뉴스 편집자다. 각 기사마다 한국어 제목과 요약을 생성한다.\n"
         "규칙:\n"
-        "1) 원문에 충실. 없는 내용 추가 금지. 과장/해석 금지.\n"
-        "2) 투자 라운드, 금액, 회사명, 기술명은 정확히 보존.\n"
-        "3) 기자체. 건조한 서술체.\n"
-        "4) 반드시 JSON 객체 1개만 반환. key = guid, value = 한글 요약 문자열."
+        "1) title_kr: 원문 제목을 자연스러운 한국어로 번역. 50자 이하. 회사명/제품명/고유명사는 널리 쓰이는 표기 유지 (예: OpenAI, Claude, GPT-5 는 영문 그대로).\n"
+        "2) summary_kr: 한국어 2~3문장(120~220자). 기자체, 건조한 서술체.\n"
+        "3) 원문에 충실. 없는 내용 추가 금지. 과장/해석 금지.\n"
+        "4) 투자 라운드, 금액, 회사명, 기술명은 정확히 보존.\n"
+        "5) 반드시 JSON 객체 1개만 반환. key=guid, value={\"title_kr\": \"...\", \"summary_kr\": \"...\"}."
     )
     user = (
-        f"{len(items)}건의 기사를 요약해라. guid 를 그대로 key 로 쓴 JSON 만 반환.\n\n{body}"
+        f"{len(items)}건의 기사를 번역+요약해라. guid 를 그대로 key 로 쓴 JSON 만 반환.\n\n{body}"
     )
 
     log.info("Claude 호출: model=%s items=%d", model, len(items))
@@ -232,11 +233,25 @@ def summarize_batch(items: list[dict]) -> dict[str, str]:
     if not isinstance(parsed, dict):
         raise RuntimeError(f"Claude 응답이 dict 가 아님: {type(parsed)}")
 
-    return {str(k): str(v) for k, v in parsed.items()}
+    # {guid: {title_kr, summary_kr}} 정규화. 구 버전(string value) 도 호환.
+    out: dict[str, dict] = {}
+    for k, v in parsed.items():
+        if isinstance(v, dict):
+            out[str(k)] = {
+                "title_kr": str(v.get("title_kr", "")).strip(),
+                "summary_kr": str(v.get("summary_kr", "")).strip(),
+            }
+        else:
+            out[str(k)] = {"title_kr": "", "summary_kr": str(v).strip()}
+    return out
 
 
-def build_slack_blocks(items: list[dict], summaries: dict[str, str]) -> list[dict]:
-    """Slack Block Kit 메시지 빌드. 소스별로 그룹핑."""
+def build_slack_blocks(items: list[dict], summaries: dict[str, dict]) -> list[dict]:
+    """Slack Block Kit 메시지 빌드. 소스별로 그룹핑.
+
+    제목 포맷: *<링크|한글 제목>* (굵은 링크)
+    한글 제목 없으면 원문 제목으로 fallback.
+    """
     now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     blocks: list[dict] = [
         {
@@ -259,9 +274,13 @@ def build_slack_blocks(items: list[dict], summaries: dict[str, str]) -> list[dic
             "text": {"type": "mrkdwn", "text": f"*{flag} {source}* · {len(src_items)}건"},
         })
         for it in src_items:
-            summary_kr = summaries.get(it["guid"], "(요약 없음)")
+            entry = summaries.get(it["guid"], {})
+            title_kr = entry.get("title_kr") or it["title"]
+            summary_kr = entry.get("summary_kr") or "(요약 없음)"
+            # Slack mrkdwn 은 링크 안 텍스트에 *bold* 가 안 먹음.
+            # 대신 링크 전체를 *...* 로 감싸면 링크 문구가 굵게 표시됨.
             text = (
-                f"• <{it['link']}|{it['title']}>\n"
+                f"• *<{it['link']}|{title_kr}>*\n"
                 f"  {summary_kr}"
             )
             blocks.append({
