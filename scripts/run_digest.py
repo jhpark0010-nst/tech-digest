@@ -40,8 +40,20 @@ log = logging.getLogger("tech-digest")
 
 KST = timezone(timedelta(hours=9))
 
-# 키워드 소문자 세트 (빠른 매칭용). 한중일 문자는 소문자 변환 영향 없음.
-_KW_LOWER = [k.lower() for k in KEYWORDS]
+# 키워드 분리: ASCII 는 단어 경계 regex, 비-ASCII(한중일)는 substring.
+# 이유: "AI" 를 단순 substring 매칭하면 "said", "airport" 등에 걸려 노이즈 과다.
+def _is_ascii(s: str) -> bool:
+    return all(ord(c) < 128 for c in s)
+
+
+_ASCII_KWS = [k for k in KEYWORDS if _is_ascii(k)]
+_CJK_KWS = [k for k in KEYWORDS if not _is_ascii(k)]
+# ASCII 키워드는 앞뒤가 단어문자가 아닌 위치에서만 매칭 (word boundary 확장판).
+# \b 만으론 "Pre-A" 같은 하이픈 포함 키워드가 안 먹어서 lookaround 로 명시.
+_ASCII_BOUNDARY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(k) for k in _ASCII_KWS) + r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 # HTML 태그 제거용
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -76,11 +88,16 @@ def strip_html(text: str) -> str:
 
 
 def match_keyword(text: str) -> bool:
-    """제목+요약에 KEYWORDS 하나라도 매칭되면 True."""
+    """제목+요약에 KEYWORDS 하나라도 매칭되면 True.
+
+    - ASCII 키워드: 단어 경계 매칭 (said 의 'ai', invoice 의 'vc' 오매칭 방지)
+    - 한중일 키워드: substring 매칭 (이 언어는 단어 경계 개념 약함)
+    """
     if not text:
         return False
-    lower = text.lower()
-    return any(kw in lower for kw in _KW_LOWER)
+    if _ASCII_BOUNDARY_RE.search(text):
+        return True
+    return any(kw in text for kw in _CJK_KWS)
 
 
 def parse_entry_time(entry: Any) -> datetime | None:
@@ -165,7 +182,8 @@ def summarize_batch(items: list[dict]) -> dict[str, str]:
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY 환경변수 미설정")
 
-    model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+    # 빈 문자열도 default 로 대체 (Secret 미등록 시 ${{ secrets.X }} 가 "" 로 평가됨)
+    model = os.environ.get("CLAUDE_MODEL", "").strip() or "claude-sonnet-4-6"
     client = anthropic.Anthropic(api_key=api_key)
 
     # 프롬프트 조립 — guid → 한글 2~3문장 요약 JSON
