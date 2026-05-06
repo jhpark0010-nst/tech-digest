@@ -173,8 +173,55 @@ def collect_all(seen: dict[str, str]) -> list[dict]:
     return all_items
 
 
+def _try_repair_unescaped_quotes(text: str):
+    """JSON string value 안 이스케이프 안 된 ASCII `"` 자동 escape 후 재파싱.
+
+    blog-kpop/blog-automation 에서 검증된 휴리스틱 스캐너. 문자열 종료처럼 보이지만
+    뒤에 구조 문자(`:`/`,`/`}`/`]`)가 따라오지 않으면 이스케이프 누락으로 간주.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            out.append(c)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            if not in_string:
+                in_string = True
+                out.append(c)
+                i += 1
+                continue
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in ":,}]":
+                in_string = False
+                out.append(c)
+                i += 1
+                continue
+            out.append("\\")
+            out.append('"')
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    try:
+        return json.loads("".join(out))
+    except json.JSONDecodeError:
+        return None
+
+
 def summarize_batch(items: list[dict]) -> dict[str, dict]:
-    """Claude 1회 호출로 전체 item 한글 제목+요약 반환. {guid: {title_kr, summary_kr}}."""
+    """Claude 1회 호출로 전체 item 한글 제목+요약 반환. {guid: {title_kr, summary_kr}}.
+
+    JSON 파싱 실패 시 temperature 흔들며 최대 2회 재시도, 그래도 실패하면
+    unescaped 큰따옴표 자동 복구 시도 (blog-kpop 동일 패턴).
+    """
     if not items:
         return {}
 
@@ -204,31 +251,57 @@ def summarize_batch(items: list[dict]) -> dict[str, dict]:
         "2) summary_kr: 한국어 2~3문장(120~220자). 기자체, 건조한 서술체.\n"
         "3) 원문에 충실. 없는 내용 추가 금지. 과장/해석 금지.\n"
         "4) 투자 라운드, 금액, 회사명, 기술명은 정확히 보존.\n"
-        "5) 반드시 JSON 객체 1개만 반환. key=guid, value={\"title_kr\": \"...\", \"summary_kr\": \"...\"}."
+        "5) 반드시 JSON 객체 1개만 반환. key=guid, value={\"title_kr\": \"...\", \"summary_kr\": \"...\"}.\n"
+        "6) ⚠️ JSON 안의 문자열 값에 ASCII 큰따옴표(\")를 직접 넣지 말 것. "
+        "원문 인용이 있으면 한국어 인용부호 \"…\" 또는 홑따옴표 '…' 로 치환. "
+        "ASCII \" 하나가 이스케이프 안 되면 응답 전체 파싱이 깨짐."
     )
     user = (
         f"{len(items)}건의 기사를 번역+요약해라. guid 를 그대로 key 로 쓴 JSON 만 반환.\n\n{body}"
     )
 
     log.info("Claude 호출: model=%s items=%d", model, len(items))
-    resp = client.messages.create(
-        model=model,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    text = resp.content[0].text.strip()
 
-    # JSON 추출 (앞뒤 ``` 제거)
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    last_text: str | None = None
+    last_err: Exception | None = None
+    for attempt in range(3):  # 1회 원본 + 2회 재시도
+        resp = client.messages.create(
+            model=model,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            temperature=min(0.3 + 0.1 * attempt, 1.0),
+        )
+        text = resp.content[0].text.strip()
+        last_text = text
 
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        log.error("Claude 응답 JSON 파싱 실패. 원문 앞 500자: %s", text[:500])
-        raise
+        # JSON 추출 (앞뒤 ``` 제거)
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+        try:
+            parsed = json.loads(text)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
+            log.warning("JSON 파싱 실패 (attempt %d/3): %s", attempt + 1, e)
+    else:
+        # 3회 모두 실패 — 마지막 응답 자동 escape 복구 시도
+        if last_text is not None:
+            stripped = last_text.strip()
+            if stripped.startswith("```"):
+                stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+                stripped = re.sub(r"\s*```$", "", stripped)
+            repaired = _try_repair_unescaped_quotes(stripped)
+            if repaired is not None:
+                log.info("JSON 자동 복구 성공 (unescaped quotes)")
+                parsed = repaired
+            else:
+                log.error("Claude 응답 JSON 파싱 최종 실패. 원문 앞 500자: %s", last_text[:500])
+                raise last_err
+        else:
+            raise last_err
 
     if not isinstance(parsed, dict):
         raise RuntimeError(f"Claude 응답이 dict 가 아님: {type(parsed)}")
