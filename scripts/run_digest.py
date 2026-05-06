@@ -173,6 +173,36 @@ def collect_all(seen: dict[str, str]) -> list[dict]:
     return all_items
 
 
+def _extract_json_object(text: str) -> str:
+    """첫 '{' 부터 균형 맞는 '}' 까지 추출. 자연어 prefix 잘라냄."""
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
 def _try_repair_unescaped_quotes(text: str):
     """JSON string value 안 이스케이프 안 된 ASCII `"` 자동 escape 후 재파싱.
 
@@ -251,7 +281,9 @@ def summarize_batch(items: list[dict]) -> dict[str, dict]:
         "2) summary_kr: 한국어 2~3문장(120~220자). 기자체, 건조한 서술체.\n"
         "3) 원문에 충실. 없는 내용 추가 금지. 과장/해석 금지.\n"
         "4) 투자 라운드, 금액, 회사명, 기술명은 정확히 보존.\n"
-        "5) 반드시 JSON 객체 1개만 반환. key=guid, value={\"title_kr\": \"...\", \"summary_kr\": \"...\"}.\n"
+        "5) 응답은 raw JSON 객체 1개. **첫 글자는 `{`, 마지막 글자는 `}`**. "
+        "마크다운 코드블록 금지, 자연어 설명/사고 prefix 금지 (예: 'Let me think...'). "
+        "key=guid, value={\"title_kr\": \"...\", \"summary_kr\": \"...\"}.\n"
         "6) ⚠️ JSON 안의 문자열 값에 ASCII 큰따옴표(\")를 직접 넣지 말 것. "
         "원문 인용이 있으면 한국어 인용부호 \"…\" 또는 홑따옴표 '…' 로 치환. "
         "ASCII \" 하나가 이스케이프 안 되면 응답 전체 파싱이 깨짐."
@@ -275,10 +307,11 @@ def summarize_batch(items: list[dict]) -> dict[str, dict]:
         text = resp.content[0].text.strip()
         last_text = text
 
-        # JSON 추출 (앞뒤 ``` 제거)
+        # JSON 추출: 앞뒤 ``` 제거 + 첫 '{' 부터 추출 (자연어 prefix 잘라냄)
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
+        text = _extract_json_object(text)
 
         try:
             parsed = json.loads(text)
@@ -293,6 +326,7 @@ def summarize_batch(items: list[dict]) -> dict[str, dict]:
             if stripped.startswith("```"):
                 stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
                 stripped = re.sub(r"\s*```$", "", stripped)
+            stripped = _extract_json_object(stripped)
             repaired = _try_repair_unescaped_quotes(stripped)
             if repaired is not None:
                 log.info("JSON 자동 복구 성공 (unescaped quotes)")
