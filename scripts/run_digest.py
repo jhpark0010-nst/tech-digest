@@ -246,12 +246,37 @@ def _try_repair_unescaped_quotes(text: str):
         return None
 
 
-def summarize_batch(items: list[dict]) -> dict[str, dict]:
-    """Claude 1회 호출로 전체 item 한글 제목+요약 반환. {guid: {title_kr, summary_kr}}.
+# 1회 API 호출당 처리할 최대 item 수. 한국어 출력 토큰 효율이 나쁘기 때문에
+# 12 정도가 안전. 30+ 건이 들어와도 여러 번 나눠 호출.
+SUMMARY_BATCH_SIZE = 12
 
-    JSON 파싱 실패 시 temperature 흔들며 최대 2회 재시도, 그래도 실패하면
-    unescaped 큰따옴표 자동 복구 시도 (blog-kpop 동일 패턴).
+
+def summarize_batch(items: list[dict]) -> dict[str, dict]:
+    """전체 item 을 SUMMARY_BATCH_SIZE 단위로 나눠 _summarize_one_batch 호출.
+
+    한 batch 가 실패해도 다음 batch 는 진행 (부분 결과라도 살림). 결과 merge.
     """
+    if not items:
+        return {}
+
+    if len(items) <= SUMMARY_BATCH_SIZE:
+        return _summarize_one_batch(items)
+
+    result: dict[str, dict] = {}
+    total_chunks = (len(items) + SUMMARY_BATCH_SIZE - 1) // SUMMARY_BATCH_SIZE
+    for ci, start in enumerate(range(0, len(items), SUMMARY_BATCH_SIZE), 1):
+        chunk = items[start:start + SUMMARY_BATCH_SIZE]
+        log.info("batch %d/%d: %d items", ci, total_chunks, len(chunk))
+        try:
+            chunk_result = _summarize_one_batch(chunk)
+            result.update(chunk_result)
+        except Exception as e:
+            log.error("batch %d/%d 실패 (계속 진행): %s", ci, total_chunks, e)
+    return result
+
+
+def _summarize_one_batch(items: list[dict]) -> dict[str, dict]:
+    """단일 batch 한 번의 API 호출. JSON 파싱 실패 시 retry + escape 복구."""
     if not items:
         return {}
 
@@ -278,7 +303,7 @@ def summarize_batch(items: list[dict]) -> dict[str, dict]:
         "너는 기술 뉴스 편집자다. 각 기사마다 한국어 제목과 요약을 생성한다.\n"
         "규칙:\n"
         "1) title_kr: 원문 제목을 자연스러운 한국어로 번역. 50자 이하. 회사명/제품명/고유명사는 널리 쓰이는 표기 유지 (예: OpenAI, Claude, GPT-5 는 영문 그대로).\n"
-        "2) summary_kr: 한국어 2~3문장(120~220자). 기자체, 건조한 서술체.\n"
+        "2) summary_kr: 한국어 2문장 이내(80~150자). 기자체, 건조한 서술체. 짧을수록 좋음.\n"
         "3) 원문에 충실. 없는 내용 추가 금지. 과장/해석 금지.\n"
         "4) 투자 라운드, 금액, 회사명, 기술명은 정확히 보존.\n"
         "5) 응답은 raw JSON 객체 1개. **첫 글자는 `{`, 마지막 글자는 `}`**. "
