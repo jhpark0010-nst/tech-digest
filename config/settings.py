@@ -113,5 +113,6 @@ LOOKBACK_HOURS = 6
 SEEN_RETENTION_DAYS = 14
 
 # ── Claude API ──
-# 요약 프롬프트에서 안정적 JSON 리턴 확보 위해 tokens 여유 있게
-MAX_OUTPUT_TOKENS = 4000
+# 26+건 한 번에 요약 시 4000 토큰으로 응답 중간 잘림 (Unterminated string).
+# Sonnet 4.6 최대 출력 8192 까지 가능. 여유롭게 8000.
+MAX_OUTPUT_TOKENS = 8000
